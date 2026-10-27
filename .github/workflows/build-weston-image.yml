@@ -1,0 +1,379 @@
+# Builds a Linux image for the RV32S emulator in Roblox Studio:
+#   - Buildroot 2024.02.x, rv32ima / ilp32 (no F/D/C), glibc
+#   - kernel with MMU (Sv32), simpledrm (framebuffer at 0x30000000), virtio-input + evdev
+#   - initramfs with Weston (DRM backend, pixman renderer), libinput, seatd, eudev
+#   - a matching device tree (RAM size, initrd range, simple-framebuffer node)
+#
+# Put this file in the repo at .github/workflows/build-weston-image.yml, then run it from
+# the Actions tab ("Build RV32 Weston image" -> Run workflow). First run takes a long time
+# (it builds a whole cross toolchain); expect 1.5-3 hours on a free runner.
+
+name: Build RV32 Weston image
+
+on:
+  workflow_dispatch:
+    inputs:
+      ram_mb:
+        description: Guest RAM in MiB (must equal RamMB in RV32Config)
+        required: true
+        default: "256"
+      buildroot_ref:
+        description: Buildroot branch or tag
+        required: true
+        default: "2024.02.x"
+      publish_release:
+        description: Publish the outputs as a GitHub release (gives plain download URLs)
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      BR_REF: ${{ inputs.buildroot_ref }}
+      RAM_MB: ${{ inputs.ram_mb }}
+    steps:
+      - name: Install host packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libncurses-dev unzip bc cpio rsync file wget \
+            python3 device-tree-compiler libssl-dev flex bison git patch perl gawk bzip2 xz-utils
+
+      - name: Fetch Buildroot
+        run: git clone --depth 1 --branch "$BR_REF" https://github.com/buildroot/buildroot.git buildroot
+
+      - name: Cache Buildroot downloads
+        uses: actions/cache@v4
+        with:
+          path: buildroot/dl
+          key: br-dl-${{ inputs.buildroot_ref }}-${{ github.run_number }}
+          restore-keys: |
+            br-dl-${{ inputs.buildroot_ref }}-
+
+      - name: Write board files (kernel fragment, rootfs overlay, device tree template)
+        run: |
+          mkdir -p board/overlay/etc/init.d
+
+          cat > board/kernel.fragment <<'EOF'
+          # no FPU, no compressed instructions, single hart: matches the emulator (rv32ima)
+          # CONFIG_SMP is not set
+          # CONFIG_FPU is not set
+          # CONFIG_RISCV_ISA_C is not set
+          # CONFIG_RISCV_ISA_ZBB is not set
+          # CONFIG_RISCV_ISA_ZICBOM is not set
+          # CONFIG_RISCV_ISA_SVPBMT is not set
+          # CONFIG_MODULES is not set
+          # CONFIG_PCI is not set
+          # CONFIG_EFI is not set
+          CONFIG_BLK_DEV_INITRD=y
+          CONFIG_DEVTMPFS=y
+          CONFIG_DEVTMPFS_MOUNT=y
+          CONFIG_TMPFS=y
+          # display: simpledrm binds to the simple-framebuffer node in the device tree
+          CONFIG_DRM=y
+          CONFIG_DRM_SIMPLEDRM=y
+          # CONFIG_DRM_FBDEV_EMULATION is not set
+          # CONFIG_FB is not set
+          # CONFIG_FRAMEBUFFER_CONSOLE is not set
+          CONFIG_VT=y
+          # input: virtio-input devices show up as evdev nodes for libinput
+          CONFIG_INPUT=y
+          CONFIG_INPUT_EVDEV=y
+          CONFIG_INPUT_MOUSEDEV=y
+          CONFIG_VIRTIO_MENU=y
+          CONFIG_VIRTIO=y
+          CONFIG_VIRTIO_MMIO=y
+          CONFIG_VIRTIO_INPUT=y
+          EOF
+          # the heredoc lines carry no extra indentation after YAML strips the block indent
+
+          cat > board/overlay/etc/weston.ini <<'EOF'
+          [core]
+          renderer=pixman
+          idle-time=0
+
+          [shell]
+          background-color=0xff1e2a38
+          panel-position=bottom
+
+          [keyboard]
+          keymap_layout=us
+          EOF
+
+          cat > board/overlay/etc/init.d/S99weston <<'EOF'
+          #!/bin/sh
+          # start the Wayland compositor on the DRM device provided by simpledrm
+          case "$1" in
+            start)
+              mkdir -p /run/user/0
+              chmod 0700 /run/user/0
+              export XDG_RUNTIME_DIR=/run/user/0
+              export LIBSEAT_BACKEND=seatd
+              export XDG_SEAT=seat0
+              (weston --backend=drm --config=/etc/weston.ini --log=/tmp/weston.log >/tmp/weston.out 2>&1 &)
+              ;;
+            stop)
+              killall weston
+              ;;
+            *)
+              echo "usage: $0 {start|stop}"
+              exit 1
+              ;;
+          esac
+          EOF
+          chmod 755 board/overlay/etc/init.d/S99weston
+
+          cat > board/rv32.dts.in <<'EOF'
+          /dts-v1/;
+          / {
+              #address-cells = <1>;
+              #size-cells = <1>;
+              compatible = "rv32ima,emu";
+              model = "rv32ima-emu";
+
+              chosen {
+                  bootargs = "earlycon=uart8250,mmio,0x10000000 console=ttyS0 loglevel=4 rdinit=/init";
+                  linux,initrd-start = <0x81000000>;
+                  linux,initrd-end = <@INITRD_END@>;
+              };
+
+              cpus {
+                  #address-cells = <1>;
+                  #size-cells = <0>;
+                  timebase-frequency = <10000000>;
+                  cpu@0 {
+                      device_type = "cpu";
+                      compatible = "riscv";
+                      reg = <0>;
+                      riscv,isa = "rv32ima";
+                      mmu-type = "riscv,sv32";
+                      status = "okay";
+                      cpu0_intc: interrupt-controller {
+                          #interrupt-cells = <1>;
+                          interrupt-controller;
+                          compatible = "riscv,cpu-intc";
+                      };
+                  };
+              };
+
+              memory@80000000 {
+                  device_type = "memory";
+                  reg = <0x80000000 @RAM_HEX@>;
+              };
+
+              soc {
+                  #address-cells = <1>;
+                  #size-cells = <1>;
+                  compatible = "simple-bus";
+                  ranges;
+                  serial@10000000 {
+                      compatible = "ns16550a";
+                      reg = <0x10000000 0x100>;
+                      clock-frequency = <1843200>;
+                      current-speed = <115200>;
+                      reg-shift = <0>;
+                  };
+              };
+
+              /* 320x200 RGBA8 framebuffer implemented by the emulator (bytes R,G,B,A = a8b8g8r8) */
+              framebuffer@30000000 {
+                  compatible = "simple-framebuffer";
+                  reg = <0x30000000 0x3e800>;
+                  width = <320>;
+                  height = <200>;
+                  stride = <1280>;
+                  format = "a8b8g8r8";
+              };
+          };
+          EOF
+
+      - name: Configure Buildroot
+        working-directory: buildroot
+        run: |
+          make qemu_riscv32_virt_defconfig
+
+          # setcfg SYMBOL LINE : drop any existing setting of SYMBOL, then append LINE
+          setcfg() { sed -i "/^$1=/d;/^# $1 is not set/d" .config; echo "$2" >> .config; }
+          on()  { setcfg "$1" "$1=y"; }
+          off() { setcfg "$1" "# $1 is not set"; }
+
+          # --- target: rv32ima, soft-float ilp32, no compressed instructions
+          on  BR2_riscv
+          on  BR2_RISCV_32
+          off BR2_riscv_g
+          on  BR2_riscv_custom
+          # symbol names changed in 2023.11; set both spellings, the unknown ones are dropped
+          on  BR2_RISCV_ISA_RVM
+          on  BR2_RISCV_ISA_RVA
+          off BR2_RISCV_ISA_RVC
+          off BR2_RISCV_ISA_RVF
+          off BR2_RISCV_ISA_RVD
+          on  BR2_RISCV_ISA_CUSTOM_RVM
+          on  BR2_RISCV_ISA_CUSTOM_RVA
+          off BR2_RISCV_ISA_CUSTOM_RVC
+          off BR2_RISCV_ISA_CUSTOM_RVF
+          off BR2_RISCV_ISA_CUSTOM_RVD
+          off BR2_RISCV_ABI_ILP32F
+          off BR2_RISCV_ABI_ILP32D
+          on  BR2_RISCV_ABI_ILP32
+          on  BR2_TOOLCHAIN_BUILDROOT_GLIBC
+
+          # --- kernel: rv32_defconfig + our fragment
+          on  BR2_LINUX_KERNEL
+          on  BR2_LINUX_KERNEL_IMAGE
+          off BR2_LINUX_KERNEL_USE_ARCH_DEFAULT_CONFIG
+          off BR2_LINUX_KERNEL_USE_CUSTOM_CONFIG
+          on  BR2_LINUX_KERNEL_USE_DEFCONFIG
+          setcfg BR2_LINUX_KERNEL_DEFCONFIG 'BR2_LINUX_KERNEL_DEFCONFIG="rv32"'
+          setcfg BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES "BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES=\"$GITHUB_WORKSPACE/board/kernel.fragment\""
+          off BR2_TARGET_OPENSBI
+
+          # --- root filesystem: plain cpio (the emulator loads it as an initrd)
+          off BR2_TARGET_ROOTFS_EXT2
+          off BR2_TARGET_ROOTFS_TAR
+          on  BR2_TARGET_ROOTFS_CPIO
+          setcfg BR2_TARGET_GENERIC_ROOT_PASSWD 'BR2_TARGET_GENERIC_ROOT_PASSWD=""'
+          setcfg BR2_TARGET_GENERIC_GETTY_PORT 'BR2_TARGET_GENERIC_GETTY_PORT="ttyS0"'
+          setcfg BR2_ROOTFS_OVERLAY "BR2_ROOTFS_OVERLAY=\"$GITHUB_WORKSPACE/board/overlay\""
+          on  BR2_ROOTFS_DEVICE_CREATION_DYNAMIC_EUDEV
+          on  BR2_PACKAGE_EUDEV
+          on  BR2_ENABLE_LOCALE_PURGE
+          setcfg BR2_ENABLE_LOCALE_WHITELIST 'BR2_ENABLE_LOCALE_WHITELIST="C en_US"'
+
+          # --- userland: Weston on DRM with the pixman renderer, plus debugging tools
+          on  BR2_PACKAGE_WESTON
+          on  BR2_PACKAGE_WESTON_DEFAULT_DRM
+          on  BR2_PACKAGE_WESTON_DRM
+          on  BR2_PACKAGE_WESTON_SHELL_DESKTOP
+          on  BR2_PACKAGE_WESTON_DEMO_CLIENTS
+          on  BR2_PACKAGE_SEATD
+          on  BR2_PACKAGE_SEATD_DAEMON
+          on  BR2_PACKAGE_LIBINPUT
+          on  BR2_PACKAGE_FONTCONFIG
+          on  BR2_PACKAGE_DEJAVU
+          on  BR2_PACKAGE_EVTEST
+          on  BR2_PACKAGE_LIBDRM_INSTALL_TESTS
+
+          make olddefconfig
+
+      - name: Check the Buildroot configuration survived olddefconfig
+        working-directory: buildroot
+        run: |
+          missing=0
+          for s in BR2_RISCV_32 BR2_riscv_custom BR2_RISCV_ABI_ILP32 BR2_TOOLCHAIN_BUILDROOT_GLIBC \
+                   BR2_LINUX_KERNEL BR2_LINUX_KERNEL_IMAGE BR2_TARGET_ROOTFS_CPIO \
+                   BR2_PACKAGE_EUDEV BR2_PACKAGE_WESTON BR2_PACKAGE_WESTON_DRM \
+                   BR2_PACKAGE_SEATD BR2_PACKAGE_LIBINPUT; do
+            if ! grep -q "^$s=y" .config; then echo "MISSING: $s"; missing=1; fi
+          done
+          for s in BR2_RISCV_ISA_RVC BR2_RISCV_ISA_RVF BR2_RISCV_ISA_RVD BR2_TARGET_OPENSBI; do
+            if grep -q "^$s=y" .config; then echo "UNEXPECTED: $s is enabled"; missing=1; fi
+          done
+          grep -E 'BR2_RISCV|BR2_LINUX_KERNEL_(DEFCONFIG|CONFIG_FRAGMENT)|BR2_PACKAGE_WESTON' .config || true
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::A required option was dropped by olddefconfig (an unmet dependency). See the list above."
+            exit 1
+          fi
+
+      - name: Build the cross toolchain
+        working-directory: buildroot
+        run: make toolchain
+
+      - name: Configure the kernel and check the drivers are really enabled
+        working-directory: buildroot
+        run: |
+          make linux-configure
+          KCFG=$(ls -d output/build/linux-*/.config | head -n1)
+          echo "kernel config: $KCFG"
+          bad=0
+          for s in CONFIG_MMU CONFIG_DRM CONFIG_DRM_SIMPLEDRM CONFIG_INPUT_EVDEV CONFIG_VIRTIO_MMIO \
+                   CONFIG_VIRTIO_INPUT CONFIG_DEVTMPFS CONFIG_BLK_DEV_INITRD; do
+            if ! grep -q "^$s=y" "$KCFG"; then echo "MISSING: $s"; bad=1; fi
+          done
+          for s in CONFIG_SMP CONFIG_FPU CONFIG_RISCV_ISA_C; do
+            if grep -q "^$s=y" "$KCFG"; then echo "UNEXPECTED: $s is enabled"; bad=1; fi
+          done
+          if [ "$bad" -ne 0 ]; then
+            echo "::error::Kernel config does not match what the emulator and Weston need. See the list above."
+            exit 1
+          fi
+
+      - name: Build everything (kernel, userland, initramfs)
+        working-directory: buildroot
+        run: make -j"$(nproc)"
+
+      - name: Build the device tree and collect outputs
+        run: |
+          IMG=buildroot/output/images
+          test -f "$IMG/Image" || { echo "::error::no kernel Image produced"; ls -la "$IMG"; exit 1; }
+          test -f "$IMG/rootfs.cpio" || { echo "::error::no rootfs.cpio produced"; ls -la "$IMG"; exit 1; }
+
+          mkdir -p out
+          cp "$IMG/Image" out/Image
+          cp "$IMG/rootfs.cpio" out/initramfs.cpio
+          cp buildroot/.config out/buildroot.config
+          cp "$(ls -d buildroot/output/build/linux-*/.config | head -n1)" out/kernel.config
+
+          KSIZE=$(stat -c%s out/Image)
+          ISIZE=$(stat -c%s out/initramfs.cpio)
+          RAM_BYTES=$((RAM_MB * 1024 * 1024))
+          INITRD_START=$((0x81000000))
+          INITRD_END=$((INITRD_START + ISIZE))
+          RAM_END=$((0x80000000 + RAM_BYTES))
+
+          # the initramfs sits at RAM+16 MiB and must leave room for the kernel's own allocations
+          if [ $((INITRD_END + 32 * 1024 * 1024)) -gt "$RAM_END" ]; then
+            echo "::error::initramfs ($ISIZE bytes) is too large for $RAM_MB MiB of RAM; re-run with a larger ram_mb"
+            exit 1
+          fi
+
+          sed -e "s/@INITRD_END@/$(printf '0x%x' "$INITRD_END")/" \
+              -e "s/@RAM_HEX@/$(printf '0x%x' "$RAM_BYTES")/" \
+              board/rv32.dts.in > out/rv32.dts
+          dtc -I dts -O dtb -o out/rv32.dtb out/rv32.dts
+          base64 -w0 out/rv32.dtb > out/rv32.dtb.b64
+          (cd out && sha256sum Image initramfs.cpio rv32.dtb > SHA256SUMS)
+
+          {
+            echo "## RV32 Weston image"
+            echo
+            echo "| file | bytes |"
+            echo "|---|---|"
+            echo "| Image | $KSIZE |"
+            echo "| initramfs.cpio | $ISIZE |"
+            echo "| rv32.dtb | $(stat -c%s out/rv32.dtb) |"
+            echo
+            echo "Roblox side: set \`RamMB = $RAM_MB\` in RV32Config, \`EXPECT_KERNEL, EXPECT_INITRD = $KSIZE, $ISIZE\` in RV32Server,"
+            echo "and replace the string in RV32MmuDtb with the contents of rv32.dtb.b64."
+            echo
+            echo '```'
+            cat out/SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: rv32-weston-image
+          path: out/
+          if-no-files-found: error
+
+      - name: Publish release
+        if: ${{ inputs.publish_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: weston-rv32-${{ github.run_number }}
+          name: RV32 Weston image #${{ github.run_number }}
+          files: |
+            out/Image
+            out/initramfs.cpio
+            out/rv32.dtb
+            out/rv32.dtb.b64
+            out/rv32.dts
+            out/SHA256SUMS
+            out/kernel.config
+            out/buildroot.config

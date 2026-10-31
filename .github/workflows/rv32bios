@@ -1,0 +1,98 @@
+
+name: Build OpenSBI Rv32 Bios
+
+on:
+  workflow_dispatch:
+    inputs:
+      opensbi_version:
+        description: OpenSBI version tag to build
+        required: true
+        default: v1.9
+      release_tag:
+        description: Release tag to publish (a release with this tag is replaced)
+        required: true
+        default: opensbi-rv32-1
+      kernel_addr:
+        description: Where the Linux kernel is loaded (the firmware jumps here)
+        required: true
+        default: "0x80400000"
+
+permissions:
+  contents: write 
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-24.04
+    env:
+      OPENSBI_VERSION: ${{ inputs.opensbi_version }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      KERNEL_ADDR: ${{ inputs.kernel_addr }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Install the cross compiler
+        run: |
+          sudo apt-get update
+      
+          sudo apt-get install -y gcc-riscv64-linux-gnu make curl
+
+      - name: Download OpenSBI ${{ inputs.opensbi_version }}
+        run: |
+          curl -fsSL "https://github.com/riscv-software-src/opensbi/archive/refs/tags/${OPENSBI_VERSION}.tar.gz" | tar xz
+          mv opensbi-* opensbi
+          ls opensbi | head
+
+      - name: Build fw_jump for RV32IMA
+        working-directory: opensbi
+        run: |
+          make -j"$(nproc)" \
+            CROSS_COMPILE=riscv64-linux-gnu- \
+            PLATFORM=generic \
+            PLATFORM_RISCV_XLEN=32 \
+            PLATFORM_RISCV_ISA=rv32ima_zicsr_zifencei \
+            PLATFORM_RISCV_ABI=ilp32 \
+            FW_TEXT_START=0x80000000 \
+            FW_JUMP_ADDR="${KERNEL_ADDR}"
+          ls -l build/platform/generic/firmware/fw_jump.*
+
+      - name: Check the result
+        run: |
+          elf=opensbi/build/platform/generic/firmware/fw_jump.elf
+          bin=opensbi/build/platform/generic/firmware/fw_jump.bin
+          riscv64-linux-gnu-readelf -h "$elf" | grep -E "Class|Machine|Entry point"
+          riscv64-linux-gnu-readelf -h "$elf" | grep -q "ELF32"           || { echo "not a 32-bit build"; exit 1; }
+          riscv64-linux-gnu-readelf -h "$elf" | grep -q "Entry point address: *0x80000000" || { echo "entry point is not 0x80000000"; exit 1; }
+          arch=$(riscv64-linux-gnu-readelf -A "$elf" | grep -i "Tag_RISCV_arch" || true)
+          echo "$arch"
+          if echo "$arch" | grep -Eq '[0-9_]c[0-9]p[0-9]'; then echo "build uses compressed instructions (C), the emulator has none"; exit 1; fi
+          [ "$(stat -c %s "$bin")" -gt 50000 ] || { echo "fw_jump.bin is suspiciously small"; exit 1; }
+
+      - name: Collect release files
+        run: |
+          mkdir out
+          cp opensbi/build/platform/generic/firmware/fw_jump.bin out/
+          cp opensbi/build/platform/generic/firmware/fw_jump.elf out/
+          (cd out && sha256sum fw_jump.bin fw_jump.elf > SHA256SUMS && cat SHA256SUMS)
+          cat > out/notes.md <<NOTES
+          OpenSBI ${OPENSBI_VERSION} built for **RV32IMA** (no C extension), platform \`generic\`, \`fw_jump\`.
+
+          | | |
+          |---|---|
+          | Load address (firmware) | \`0x80000000\` |
+          | Next stage (Linux kernel) | \`${KERNEL_ADDR}\` in S-mode |
+          | Device tree | the one passed in \`a1\` by the previous stage |
+          | ISA / ABI | \`rv32ima_zicsr_zifencei\` / \`ilp32\` |
+
+          Files: \`fw_jump.bin\` (load this), \`fw_jump.elf\` (symbols, for debugging), \`SHA256SUMS\`.
+          Built by workflow run ${GITHUB_RUN_ID} from commit ${GITHUB_SHA}.
+          NOTES
+
+      - name: Publish the release
+        working-directory: out
+        run: |
+          gh release delete "$RELEASE_TAG" --cleanup-tag --yes || true
+          gh release create "$RELEASE_TAG" fw_jump.bin fw_jump.elf SHA256SUMS \
+            --title "OpenSBI ${OPENSBI_VERSION} for RV32IMA (jumps to ${KERNEL_ADDR})" \
+            --notes-file notes.md \
+            --target "$GITHUB_SHA"
+          echo "Download: https://github.com/${GH_REPO}/releases/download/${RELEASE_TAG}/fw_jump.bin" >> "$GITHUB_STEP_SUMMARY"
